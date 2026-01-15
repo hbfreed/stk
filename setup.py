@@ -1,6 +1,7 @@
 from setuptools import find_packages, setup
 
 install_requires = [
+    'numpy',
     'torch>=2.3.0,<3.0',
     'triton>=2.1.0',
 ]
