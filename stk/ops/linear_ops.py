@@ -4,7 +4,7 @@ from stk.backend import sputnik
 from stk.matrix import Matrix
 
 
-def dsd(a, b, activation="none"):
+def dsd(a, b):
     assert isinstance(a, Matrix)
     assert isinstance(b, torch.Tensor)
     return sputnik.dsd(
@@ -16,7 +16,7 @@ def dsd(a, b, activation="none"):
         a.column_indices_t,
         a.block_offsets_t,
         not a.is_contiguous(),
-        b, activation)
+        b)
 
 
 def dds(a, b):

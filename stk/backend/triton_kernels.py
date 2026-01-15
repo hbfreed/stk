@@ -80,7 +80,7 @@ def _sdd_kernel(A, B, C, M, N, K,
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def _dsd_kernel_fused(A, B, C, M, N, K,
+def _dsd_kernel(A, B, C, M, N, K,
             stride_am, stride_ak,
             stride_bk, stride_bn,
             stride_cm, stride_cn,
@@ -88,7 +88,6 @@ def _dsd_kernel_fused(A, B, C, M, N, K,
             block_offsets_t, trans_A: tl.constexpr, trans_B: tl.constexpr,
             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
             BLOCK_SIZE: tl.constexpr, GROUP_M: tl.constexpr, ACC_TYPE: tl.constexpr,
-            ACTIVATION: tl.constexpr,
             ):
 
     # matrix multiplication
@@ -137,21 +136,6 @@ def _dsd_kernel_fused(A, B, C, M, N, K,
         b = tl.load(ptr_B)
         acc += tl.dot(a, b)
 
-    # Apply activation while still in fp32
-    if ACTIVATION == "relu":
-        acc = tl.maximum(acc, 0.0)
-    elif ACTIVATION == "relu_squared":
-        acc = tl.maximum(acc, 0.0)
-        acc = acc * acc
-    elif ACTIVATION == "silu":
-        acc = acc * tl.sigmoid(acc)
-    elif ACTIVATION == "gelu":
-        # tanh(x) = 2 * sigmoid(2x) - 1
-        tanh_arg = 0.7978845608 * (acc + 0.044715 * acc * acc * acc)
-        tanh_val = 2.0 * tl.sigmoid(2.0 * tanh_arg) - 1.0
-        acc = 0.5 * acc * (1.0 + tanh_val)
-
-    # Convert to output dtype after activation
     acc = acc.to(C.dtype.element_ty)
 
     cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -224,7 +208,8 @@ def _dds_kernel(A, B, C, M, N, K,
         else:
             ptr_B = B + tl.load(block_offsets_t + start_inx + block_inx) * BLOCK_ELEMENTS + sub_block_inx * bk_sub_incr
 
-        ptr_A = A + tl.load(column_indices + start_inx + block_inx) * ak_block_incr + sub_block_inx * ak_sub_incr
+        col = tl.load(column_indices + start_inx + block_inx)
+        ptr_A = A + col * ak_block_incr + sub_block_inx * ak_sub_incr
         a = tl.load(ptr_A)
         b = tl.load(ptr_B)
         acc += tl.dot(a, b)
@@ -245,8 +230,7 @@ def dsd(shape,
         block_offsets_t,
         transpose_a,
         rhs,
-        out,
-        activation="none"
+        out
     ):
 
     device = rhs.device
@@ -281,15 +265,14 @@ def dsd(shape,
     if trans_B:
         stride_bk, stride_bn = rhs.stride(1), rhs.stride(0)
 
-    _dsd_kernel_fused[grid](
+    _dsd_kernel[grid](
         data.data, rhs, out, M, N, K,
         stride_am, stride_ak,
         stride_bk, stride_bn,
         out.stride(0), out.stride(1),
         row_indices, a_column_indices, a_offsets,
         block_offsets_t, trans_A, trans_B,
-        GROUP_M=128, ACC_TYPE=ACC_TYPE,
-        ACTIVATION=activation
+        GROUP_M=128, ACC_TYPE=ACC_TYPE
     )
     # return out
 
