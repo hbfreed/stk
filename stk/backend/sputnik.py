@@ -96,43 +96,87 @@ class DSD(torch.autograd.Function):
                 column_indices_t,
                 block_offsets_t,
                 transpose_a,
-                rhs):
-        ctx.save_for_backward(data,
-                              offsets,
-                              row_indices,
-                              column_indices,
-                              offsets_t,
-                              column_indices_t,
-                              block_offsets_t,
-                              rhs)
+                rhs,
+                activation="none"):
         ctx.shape = _standardize_shape(shape, transpose_a)
         ctx.transpose_a = transpose_a
+        ctx.activation = activation
 
         out = torch.empty(
             (shape[0], rhs.size()[1]),
             dtype=rhs.dtype,
             device=rhs.device)
 
-        backend.dsd(shape,
-                    data,
-                    offsets,
-                    row_indices,
-                    column_indices,
-                    offsets_t,
-                    column_indices_t,
-                    block_offsets_t,
-                    transpose_a,
-                    rhs,
-                    out)
+        if activation == "none":
+            # No activation - just matmul
+            backend.dsd(shape, data, offsets, row_indices, column_indices,
+                        offsets_t, column_indices_t, block_offsets_t,
+                        transpose_a, rhs, out, activation="none")
+            ctx.save_for_backward(data, offsets, row_indices, column_indices,
+                                  offsets_t, column_indices_t, block_offsets_t, rhs)
+        elif activation == "relu":
+            # ReLU: use fused kernel, save output (output > 0 tells us gradient mask)
+            backend.dsd(shape, data, offsets, row_indices, column_indices,
+                        offsets_t, column_indices_t, block_offsets_t,
+                        transpose_a, rhs, out, activation="relu")
+            ctx.save_for_backward(data, offsets, row_indices, column_indices,
+                                  offsets_t, column_indices_t, block_offsets_t, rhs, out)
+        elif activation == "relu_squared":
+            # ReLU²: compute matmul, save pre_act, apply activation
+            backend.dsd(shape, data, offsets, row_indices, column_indices,
+                        offsets_t, column_indices_t, block_offsets_t,
+                        transpose_a, rhs, out, activation="none")
+            pre_act = out  # keep reference
+            out = torch.relu(pre_act) ** 2
+            ctx.save_for_backward(data, offsets, row_indices, column_indices,
+                                  offsets_t, column_indices_t, block_offsets_t, rhs, pre_act)
+        else:
+            # silu/gelu: compute matmul, save pre_act, apply activation in PyTorch
+            backend.dsd(shape, data, offsets, row_indices, column_indices,
+                        offsets_t, column_indices_t, block_offsets_t,
+                        transpose_a, rhs, out, activation="none")
+            pre_act = out  # keep reference
+            if activation == "silu":
+                out = torch.nn.functional.silu(pre_act)
+            elif activation == "gelu":
+                out = torch.nn.functional.gelu(pre_act, approximate='tanh')
+            ctx.save_for_backward(data, offsets, row_indices, column_indices,
+                                  offsets_t, column_indices_t, block_offsets_t, rhs, pre_act)
+
         return out
 
     @staticmethod
     @custom_bwd
     def backward(ctx, dy):
         saved_tensors = ctx.saved_tensors
-        lhs = (ctx.shape,) + saved_tensors[:-1]
-        rhs = saved_tensors[-1]
         trans_a = ctx.transpose_a
+
+        if ctx.activation == "none":
+            lhs = (ctx.shape,) + saved_tensors[:-1]
+            rhs = saved_tensors[-1]
+        else:
+            # Last tensor is pre_act (or out for relu), second to last is rhs
+            lhs = (ctx.shape,) + saved_tensors[:-2]
+            rhs = saved_tensors[-2]
+            saved_act = saved_tensors[-1]
+
+            if ctx.activation == "relu":
+                # saved_act is the output; use it to determine where pre_act > 0
+                dy = dy * (saved_act > 0).to(dy.dtype)
+            elif ctx.activation == "relu_squared":
+                # saved_act is pre_act
+                dy = dy * 2 * torch.clamp(saved_act, min=0)
+            elif ctx.activation == "silu":
+                sig = torch.sigmoid(saved_act)
+                dy = dy * (sig + saved_act * sig * (1 - sig))
+            elif ctx.activation == "gelu":
+                k = 0.7978845608
+                x3 = saved_act ** 3
+                tanh_arg = k * (saved_act + 0.044715 * x3)
+                tanh_val = torch.tanh(tanh_arg)
+                sech2 = 1 - tanh_val ** 2
+                dy = dy * (0.5 * (1 + tanh_val) + 0.5 * saved_act * sech2 * k * (1 + 0.134145 * saved_act ** 2))
+
         trans_b = _is_transposed(rhs)
 
         ddata = None
@@ -144,7 +188,7 @@ class DSD(torch.autograd.Function):
                                   trans_a,
                                   trans_b)
         drhs = None
-        if ctx.needs_input_grad[-1]:
+        if ctx.needs_input_grad[9]:  # rhs
             op = dds if trans_b else dsd
             drhs = _rhs_gradient(op,
                                  lhs,
@@ -152,7 +196,7 @@ class DSD(torch.autograd.Function):
                                  dy,
                                  trans_a,
                                  trans_b)
-        return None, ddata, None, None, None, None, None, None, None, drhs
+        return None, ddata, None, None, None, None, None, None, None, drhs, None
 
 
 dsd = DSD.apply
